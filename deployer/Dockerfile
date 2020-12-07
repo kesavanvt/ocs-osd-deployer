@@ -5,6 +5,8 @@ RUN microdnf update -y && \
     microdnf install -y \
       bash \
       kubectl \
+    && curl -L https://github.com/mikefarah/yq/releases/download/3.4.1/yq_linux_amd64 -o /bin/yq \
+    && chmod +x /bin/yq \
     && microdnf clean all && \
     rm -rf /var/cache/yum
 

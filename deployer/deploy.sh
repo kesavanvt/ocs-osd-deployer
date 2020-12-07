@@ -23,9 +23,19 @@ osds=$((${QUOTA_COUNT:-1} * 3))
 echo "Quota count: ${QUOTA_COUNT} -- OSD count: ${osds}"
 
 #-- Patch the OSD count into the StorageCluster & apply it
+#-- If config map containing StorageCluster exists, merge it with the 
+#-- existing StorageCluster
 while true; do
-    sed "s/STORAGE_NODES/${osds}/" storagecluster.yml | \
-      kubectl -n openshift-storage apply -f -
+    sc_content=`kubectl get configmaps storagecluster -n openshift-storage -oyaml 2> /dev/null`
+    if [ $? -ne 0 ]
+    then
+        sed "s/STORAGE_NODES/${osds}/" storagecluster.yml | \
+        kubectl -n openshift-storage apply -f -
+    else
+        echo "configmap is used to merge StorageCluster properties"
+        echo "$sc_content" | yq r - "data.*" | yq merge - storagecluster.yml | \
+        kubectl -n openshift-storage apply -f -
+    fi
     sleep 60
 done
 
