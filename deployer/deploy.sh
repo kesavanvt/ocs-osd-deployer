@@ -22,6 +22,15 @@ osds=$((${QUOTA_COUNT:-1} * 3))
 
 echo "Quota count: ${QUOTA_COUNT} -- OSD count: ${osds}"
 
+gp2Quota=`oc get clusterresourcequota/persistent-volume-quota -o=jsonpath='{.spec.quota.hard.requests\.storage}'`
+
+#-- Patch the persistent volume quota for restricting only the gp2 storage class
+if [ -n "${gp2Quota}" ]; then
+    oc patch clusterresourcequota/persistent-volume-quota --type='json' \
+    --patch '[{ "op": "remove", "path": "/spec/quota/hard/requests.storage"},
+    {"op": "add", "path": "/spec/quota/hard/gp2.storageclass.storage.k8s.io~1requests.storage", "value": "'${gp2Quota}'" }]'
+fi
+
 #-- The path mapped to StorageCluster configmap used for overriding.
 overridePath="/sc-override/storagecluster.yml"
 
