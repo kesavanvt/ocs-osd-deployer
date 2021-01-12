@@ -22,6 +22,16 @@ osds=$((${QUOTA_COUNT:-1} * 3))
 
 echo "Quota count: ${QUOTA_COUNT} -- OSD count: ${osds}"
 
+#-- Get all worker nodes
+nodeList=( $(kubectl get nodes -l node-role.kubernetes.io/worker=,node-role.kubernetes.io/infra!= \
+--no-headers -o custom-columns=":metadata.name") )
+
+#-- Label all worker nodes
+for node in "${nodeList[@]}"
+do
+kubectl label nodes $node cluster.ocs.openshift.io/openshift-storage=''
+done
+
 #-- The path mapped to StorageCluster configmap used for overriding.
 overridePath="/sc-override/storagecluster.yml"
 

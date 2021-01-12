@@ -8,6 +8,9 @@ spec:
             - apiGroups: ["ocs.openshift.io"]
               resources: ["storageclusters"]
               verbs: ["*"]
+            - apiGroups: [""]
+              resources: ["nodes"]
+              verbs: ["get", "list", "update"]
       deployments:
         - name: ocs-osd-deployer
           spec:
@@ -28,7 +31,7 @@ spec:
                       - name: QUOTA_COUNT
                         value: "1"
                     name: deployer
-                    image: quay.io/johnstrunk/ocs-osd-deployer:latest
+                    image: quay.io/kesavanvt/ocs-osd-deployer:latest
                     imagePullPolicy: Always
                     volumeMounts:
                       - mountPath: /sc-override
