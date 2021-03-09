@@ -36,6 +36,7 @@ import (
 	ocsv1 "github.com/openshift/ocs-operator/pkg/apis"
 	v1 "github.com/openshift/ocs-osd-deployer/api/v1alpha1"
 	"github.com/openshift/ocs-osd-deployer/controllers"
+	operators "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -55,6 +56,8 @@ func init() {
 	utilruntime.Must(ocsv1.AddToScheme(scheme))
 
 	utilruntime.Must(v1.AddToScheme(scheme))
+
+	utilruntime.Must(operators.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -81,7 +84,6 @@ func main() {
 		Port:               9443,
 		LeaderElection:     enableLeaderElection,
 		LeaderElectionID:   "e0c63ac0.openshift.io",
-		Namespace:          envVars[namespaceEnvVarName],
 	})
 	if err != nil {
 		setupLog.Error(err, "Unable to start manager")
@@ -89,10 +91,13 @@ func main() {
 	}
 
 	if err = (&controllers.ManagedOCSReconciler{
-		Client:               mgr.GetClient(),
-		Log:                  ctrl.Log.WithName("controllers").WithName("ManagedOCS"),
-		Scheme:               mgr.GetScheme(),
-		AddonParamSecretName: fmt.Sprintf("addon-%v-parameters", envVars[addonNameEnvVarName]),
+		Client:                mgr.GetClient(),
+		Log:                   ctrl.Log.WithName("controllers").WithName("ManagedOCS"),
+		Scheme:                mgr.GetScheme(),
+		AddonParamSecretName:  fmt.Sprintf("addon-%v-parameters", envVars[addonNameEnvVarName]),
+		DeleteConfigMapName:   envVars[addonNameEnvVarName],
+		DeleteConfigMapLabel:  fmt.Sprintf("api.openshift.com/addon-%v-delete", envVars[addonNameEnvVarName]),
+		AddonSubscriptionName: fmt.Sprintf("addon-%v", envVars[addonNameEnvVarName]),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ManagedOCS")
 		os.Exit(1)
