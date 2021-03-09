@@ -1,15 +1,16 @@
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
   creationTimestamp: null
   name: manager-role
-  namespace: system
 rules:
 - apiGroups:
   - ""
   resources:
+  - configmaps
+  - persistentvolumeclaims
   - secrets
   verbs:
   - get
@@ -40,6 +41,19 @@ rules:
   - ocs.openshift.io
   resources:
   - storageclusters
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - operators.coreos.com
+  resources:
+  - clusterserviceversions
+  - subscriptions
   verbs:
   - create
   - delete
