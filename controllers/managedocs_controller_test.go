@@ -9,6 +9,7 @@ import (
 	. "github.com/onsi/gomega"
 	ocsv1 "github.com/openshift/ocs-operator/pkg/apis/ocs/v1"
 	v1 "github.com/openshift/ocs-osd-deployer/api/v1alpha1"
+	operators "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -344,6 +345,120 @@ var _ = Describe("ManagedOCS controller", func() {
 					err := k8sClient.Get(ctx, scKey, sc)
 					return err == nil && reflect.DeepEqual(sc.Spec, defaults)
 				}, duration, interval).Should(BeTrue())
+			})
+		})
+
+		When("there is an add-on comfigmap with incorrect deletion label", func() {
+			It("should not remove ocs resources", func() {
+				ctx := context.Background()
+
+				managedOCS := &v1.ManagedOCS{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      ManagedOCSName,
+						Namespace: TestNamespace,
+					},
+				}
+				sc := &ocsv1.StorageCluster{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      storageClusterName,
+						Namespace: TestNamespace,
+					},
+				}
+
+				Expect(k8sClient.Get(ctx, getResourceKey(sc), sc)).Should(Succeed())
+				sc.Status.Phase = "Ready"
+				Expect(k8sClient.Status().Update(ctx, sc)).Should(Succeed())
+
+				// Create the configmap
+				cm := &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      TestDeleteConfigMapName,
+						Namespace: TestNamespace,
+						Labels: map[string]string{
+							"blah-blah": "true",
+						},
+					},
+				}
+				Expect(k8sClient.Create(ctx, cm)).Should(Succeed())
+				Expect(k8sClient.Get(ctx, getResourceKey(cm), cm)).Should(Succeed())
+
+				// wait to trigger the reconcile logic
+				time.Sleep(time.Second * 3)
+
+				Expect(k8sClient.Get(ctx, getResourceKey(managedOCS), managedOCS)).Should(Succeed())
+				Expect(k8sClient.Get(ctx, getResourceKey(sc), sc)).Should(Succeed())
+
+				// Remove the configmap for future cases
+				Expect(k8sClient.Delete(ctx, cm)).Should(Succeed())
+			})
+		})
+
+		When("there is an add-on comfigmap with deletion label", func() {
+			It("should remove all the ocs resource", func() {
+				ctx := context.Background()
+
+				managedOCS := &v1.ManagedOCS{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      ManagedOCSName,
+						Namespace: TestNamespace,
+					},
+				}
+				sc := &ocsv1.StorageCluster{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      storageClusterName,
+						Namespace: TestNamespace,
+					},
+				}
+				sub := &operators.Subscription{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      TestAddonSubscriptionName,
+						Namespace: TestNamespace,
+					},
+					Spec: &operators.SubscriptionSpec{},
+				}
+				Expect(k8sClient.Create(ctx, sub)).Should(Succeed())
+				Expect(k8sClient.Get(ctx, getResourceKey(sub), sub)).Should(Succeed())
+
+				csv := &operators.ClusterServiceVersion{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      TestdeployerCSV,
+						Namespace: TestNamespace,
+					},
+					Spec: operators.ClusterServiceVersionSpec{
+						InstallStrategy: operators.NamedInstallStrategy{
+							StrategyName: "test-strategy",
+							StrategySpec: operators.StrategyDetailsDeployment{
+								DeploymentSpecs: []operators.StrategyDeploymentSpec{},
+							},
+						},
+					},
+				}
+				Expect(k8sClient.Create(ctx, csv)).Should(Succeed())
+				Expect(k8sClient.Get(ctx, getResourceKey(csv), csv)).Should(Succeed())
+
+				// Create the configmap
+				cm := &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      TestDeleteConfigMapName,
+						Namespace: TestNamespace,
+						Labels: map[string]string{
+							TestDeleteConfigMapLabel: "true",
+						},
+					},
+				}
+				Expect(k8sClient.Create(ctx, cm)).Should(Succeed())
+				Expect(k8sClient.Get(ctx, getResourceKey(cm), cm)).Should(Succeed())
+
+				// wait to trigger the reconcile logic
+				time.Sleep(time.Second * 3)
+
+				ensureNoResource(ctx, managedOCS)
+
+				ensureNoResource(ctx, sc)
+
+				ensureNoResource(ctx, sub)
+
+				ensureNoResource(ctx, csv)
 			})
 		})
 	})
