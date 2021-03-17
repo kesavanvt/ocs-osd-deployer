@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
+	operators "github.com/operator-framework/api/pkg/operators/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -44,17 +46,25 @@ import (
 )
 
 const (
-	storageClusterName  = "ocs-storagecluster"
-	storageClassSizeKey = "size"
-	deviceSetName       = "default"
+	storageClusterName     = "ocs-storagecluster"
+	storageClassSizeKey    = "size"
+	deviceSetName          = "default"
+	storageClassRbdName    = "ocs-storagecluster-ceph-rbd"
+	storageClassCephFsName = "ocs-storagecluster-cephfs"
+	deployerCsvPrefix      = "ocs-osd-deployer"
+	managedOcsFinalizer    = "managedocs.ocs.openshift.io"
 )
 
 // ManagedOCSReconciler reconciles a ManagedOCS object
 type ManagedOCSReconciler struct {
 	client.Client
-	Log                  logr.Logger
-	Scheme               *runtime.Scheme
-	AddonParamSecretName string
+	UnrestrictedClient      client.Client
+	Log                     logr.Logger
+	Scheme                  *runtime.Scheme
+	AddonParamSecretName    string
+	DeleteConfigMapName     string
+	DeleteConfigMapLabelKey string
+	AddonSubscriptionName   string
 
 	ctx        context.Context
 	managedOCS *v1.ManagedOCS
@@ -66,6 +76,8 @@ type ManagedOCSReconciler struct {
 // +kubebuilder:rbac:groups=ocs.openshift.io,namespace=system,resources=managedocs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ocs.openshift.io,namespace=system,resources=storageclusters,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",namespace=system,resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=operators.coreos.com,namespace=system,resources={subscriptions,clusterserviceversions},verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 
 // SetupWithManager TODO
 func (r *ManagedOCSReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -90,12 +102,30 @@ func (r *ManagedOCSReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			},
 		),
 	}
+	deleteLabelWatchHandler := handler.EnqueueRequestsFromMapFunc{
+		ToRequests: handler.ToRequestsFunc(
+			func(obj handler.MapObject) []reconcile.Request {
+				if obj.Meta.GetName() == r.DeleteConfigMapName {
+					if _, ok := obj.Meta.GetLabels()[r.DeleteConfigMapLabelKey]; ok {
+						return []reconcile.Request{{
+							NamespacedName: types.NamespacedName{
+								Name:      "managedocs",
+								Namespace: obj.Meta.GetNamespace(),
+							},
+						}}
+					}
+				}
+				return nil
+			},
+		),
+	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		WithOptions(ctrlOptions).
 		For(&v1.ManagedOCS{}, managedOCSPredicates).
 		Owns(&ocsv1.StorageCluster{}).
 		Watches(&source.Kind{Type: &corev1.Secret{}}, &addonParamsSecretWatchHandler).
+		Watches(&source.Kind{Type: &corev1.ConfigMap{}}, &deleteLabelWatchHandler).
 		Complete(r)
 }
 
@@ -110,17 +140,24 @@ func (r *ManagedOCSReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 	// Load the managed ocs resource
 	r.managedOCS = &v1.ManagedOCS{}
 	if err := r.Get(r.ctx, req.NamespacedName, r.managedOCS); err != nil {
-		return ctrl.Result{}, err
+		if errors.IsNotFound(err) {
+			r.Log.Info("ManagedOCS resource not found")
+		} else {
+			return ctrl.Result{}, err
+		}
 	}
 
 	// Run the reconcile phases
-	err := r.reconcilePhases()
+	result, err := r.reconcilePhases()
 	if err != nil {
 		r.Log.Error(err, "An error was encountered during reconcilePhases")
 	}
 
 	// Ensure status is updated once even on failed reconciles
-	statusErr := r.Status().Update(r.ctx, r.managedOCS)
+	var statusErr error
+	if r.managedOCS.UID != "" {
+		statusErr = r.Status().Update(r.ctx, r.managedOCS)
+	}
 
 	// Reconcile errors have priority to status update errors
 	if err != nil {
@@ -128,35 +165,87 @@ func (r *ManagedOCSReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 	} else if statusErr != nil {
 		return ctrl.Result{}, statusErr
 	} else {
-		return ctrl.Result{}, nil
+		return result, nil
 	}
 }
 
-func (r *ManagedOCSReconciler) reconcilePhases() error {
+func (r *ManagedOCSReconciler) reconcilePhases() (reconcile.Result, error) {
 	// Update the status of the components
 	r.managedOCS.Status.Components = r.updateComponents()
 
-	// Set the effective reconcile strategy
-	reconcileStrategy := v1.ReconcileStrategyStrict
-	if strings.EqualFold(string(r.managedOCS.Spec.ReconcileStrategy), string(v1.ReconcileStrategyNone)) {
-		reconcileStrategy = v1.ReconcileStrategyNone
-	}
-	r.managedOCS.Status.ReconcileStrategy = reconcileStrategy
+	if !r.managedOCS.DeletionTimestamp.IsZero() {
 
-	// Create or update an existing storage cluster
-	storageCluster := &ocsv1.StorageCluster{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      storageClusterName,
-			Namespace: r.namespace,
-		},
-	}
-	if _, err := ctrl.CreateOrUpdate(r.ctx, r, storageCluster, func() error {
-		return r.generateStorageCluster(reconcileStrategy, storageCluster)
-	}); err != nil {
-		return err
+		err := r.deleteComponents()
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		componentsDeleted := r.areComponentsDeleted()
+
+		if componentsDeleted {
+			r.Log.Info("Removing finalizer on managedOCS")
+			r.managedOCS.ObjectMeta.Finalizers = remove(r.managedOCS.ObjectMeta.Finalizers, managedOcsFinalizer)
+			if err := r.Client.Update(context.Background(), r.managedOCS); err != nil {
+				r.Log.Info("Update Error", "MetaUpdateErr", "Failed to remove finalizer from managedOcs")
+				return ctrl.Result{}, err
+			}
+			r.Log.Info("managedOCS removed successfully")
+		}
+	} else if r.managedOCS.DeletionTimestamp.IsZero() && r.managedOCS.UID != "" {
+		
+		if !contains(r.managedOCS.GetFinalizers(), managedOcsFinalizer) {
+			r.Log.Info("Finalizer not found for managedOCS. Adding finalizer")
+			r.managedOCS.ObjectMeta.Finalizers = append(r.managedOCS.ObjectMeta.Finalizers, managedOcsFinalizer)
+			if err := r.Client.Update(context.Background(), r.managedOCS); err != nil {
+				r.Log.Info("Update Error", "MetaUpdateErr", "Failed to update managedOCS with finalizer")
+				return ctrl.Result{}, err
+			}
+		}
+		// Set the effective reconcile strategy
+		reconcileStrategy := v1.ReconcileStrategyStrict
+		if strings.EqualFold(string(r.managedOCS.Spec.ReconcileStrategy), string(v1.ReconcileStrategyNone)) {
+			reconcileStrategy = v1.ReconcileStrategyNone
+		}
+		r.managedOCS.Status.ReconcileStrategy = reconcileStrategy
+
+		// Create or update an existing storage cluster
+		storageCluster := &ocsv1.StorageCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      storageClusterName,
+				Namespace: r.namespace,
+			},
+		}
+		if _, err := ctrl.CreateOrUpdate(r.ctx, r, storageCluster, func() error {
+			return r.generateStorageCluster(reconcileStrategy, storageCluster)
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		if r.areComponentsReadyForUninstall() && r.checkUninstallCondition() {
+			found, err := r.findOcsPvcs()
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if found {
+				return ctrl.Result{Requeue: true, RequeueAfter: 10 * time.Second}, nil
+			}
+			r.Log.Info("Starting OCS uninstallation")
+
+			r.Log.Info("Deleting managedOCS")
+			if err = r.deleteResource(r.Client, r.managedOCS, r.managedOCS.Name); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	} else if r.checkUninstallCondition() {
+
+		if err := r.removeOlmComponents(); err != nil {
+			return ctrl.Result{}, err
+		} else {
+			return ctrl.Result{}, nil
+		}
 	}
 
-	return nil
+	return ctrl.Result{}, nil
 }
 
 // Set the desired stats for the storage cluster resource
@@ -254,4 +343,139 @@ func (r *ManagedOCSReconciler) updateComponents() v1.ComponentStatusMap {
 	}
 
 	return components
+}
+
+func (r *ManagedOCSReconciler) checkUninstallCondition() bool {
+	cmNamespaceName := types.NamespacedName{
+		Name:      r.DeleteConfigMapName,
+		Namespace: r.namespace,
+	}
+
+	configmap := &corev1.ConfigMap{}
+	err := r.Get(r.ctx, cmNamespaceName, configmap)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return false
+		}
+		r.Log.Error(err, "Unable to get configMap")
+		return false
+	}
+	labels := configmap.Labels
+	_, ok := labels[r.DeleteConfigMapLabelKey]
+	return ok
+}
+
+func (r *ManagedOCSReconciler) removeOlmComponents() error {
+
+	r.Log.Info("Deleting subscription")
+	subscription := &operators.Subscription{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      r.AddonSubscriptionName,
+			Namespace: r.namespace,
+		},
+	}
+	if err := r.deleteResource(r.Client, subscription, r.AddonSubscriptionName); err != nil {
+		return err
+	}
+	r.Log.Info("subscription removed successfully")
+
+	r.Log.Info("Deleting CSV")
+	csvList := &operators.ClusterServiceVersionList{}
+	err := r.Client.List(r.ctx, csvList)
+	if err != nil {
+		r.Log.Error(err, "Unable to list CSVs")
+		return err
+	}
+	for _, csv := range csvList.Items {
+		if strings.HasPrefix(csv.Name, deployerCsvPrefix) {
+			deployerCsvName := csv.Name
+			csv := &operators.ClusterServiceVersion{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      deployerCsvName,
+					Namespace: r.namespace,
+				},
+			}
+			if err := r.deleteResource(r.Client, csv, deployerCsvName); err != nil {
+				return err
+			}
+		}
+	}
+	r.Log.Info("CSV removed successfully")
+
+	return nil
+}
+
+func (r *ManagedOCSReconciler) areComponentsReadyForUninstall() bool {
+	subComponent := r.managedOCS.Status.Components
+
+	if subComponent.StorageCluster.State != v1.ComponentReady {
+		return false
+	}
+	return true
+}
+
+func (r *ManagedOCSReconciler) deleteComponents() error {
+	r.Log.Info("Deleting storageCluster")
+	if err := r.deleteResource(r.Client, &ocsv1.StorageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: storageClusterName, Namespace: r.namespace},
+	}, storageClusterName); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *ManagedOCSReconciler) areComponentsDeleted() bool {
+	subComponent := r.managedOCS.Status.Components
+
+	if subComponent.StorageCluster.State == v1.ComponentNotFound {
+		return true
+	}
+	return false
+}
+
+func (r *ManagedOCSReconciler) findOcsPvcs() (bool, error) {
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	err := r.UnrestrictedClient.List(r.ctx, pvcList)
+	if err != nil {
+		return false, fmt.Errorf("Unable to list PVCs: %v", err)
+	}
+	for _, pvc := range pvcList.Items {
+		scName := *pvc.Spec.StorageClassName
+		if scName == storageClassCephFsName || scName == storageClassRbdName {
+			r.Log.Info("Found Consumer PVCs using OCS storageclasses, cannot proceed on uninstalltion")
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *ManagedOCSReconciler) deleteResource(cl client.Client, resource runtime.Object, resourceName string) error {
+	err := cl.Delete(r.ctx, resource)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		r.Log.Error(err, "Uninstall: unable to delete resource", "resource", resourceName)
+		return err
+	}
+	return nil
+}
+
+func contains(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+func remove(slice []string, s string) (result []string) {
+	for _, item := range slice {
+		if item == s {
+			continue
+		}
+		result = append(result, item)
+	}
+	return
 }
