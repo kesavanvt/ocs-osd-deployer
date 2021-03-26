@@ -52,7 +52,6 @@ const (
 	storageClassRbdName    = "ocs-storagecluster-ceph-rbd"
 	storageClassCephFsName = "ocs-storagecluster-cephfs"
 	deployerCsvPrefix      = "ocs-osd-deployer"
-	managedOcsFinalizer    = "managedocs.ocs.openshift.io"
 )
 
 // ManagedOCSReconciler reconciles a ManagedOCS object
@@ -170,7 +169,7 @@ func (r *ManagedOCSReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) 
 }
 
 func (r *ManagedOCSReconciler) reconcilePhases() (reconcile.Result, error) {
-	if r.managedOCS.UID != "" {
+	if r.managedOCS.DeletionTimestamp.IsZero() && r.managedOCS.UID != "" {
 		// Update the status of the components
 		r.managedOCS.Status.Components = r.updateComponents()
 
@@ -194,9 +193,7 @@ func (r *ManagedOCSReconciler) reconcilePhases() (reconcile.Result, error) {
 			return ctrl.Result{}, err
 		}
 
-		if r.areComponentsReadyForUninstall() &&
-			r.managedOCS.DeletionTimestamp.IsZero() &&
-			r.checkUninstallCondition() {
+		if r.areComponentsReadyForUninstall() && r.checkUninstallCondition() {
 			found, err := r.findOcsPvcs()
 			if err != nil {
 				return ctrl.Result{}, err
@@ -212,11 +209,16 @@ func (r *ManagedOCSReconciler) reconcilePhases() (reconcile.Result, error) {
 			}
 		}
 	} else {
-		if r.checkUninstallCondition() {
-			if result, err := r.removeOlmComponents(); err != nil {
-				return result, err
-			} else {
-				return result, nil
+		dependentsDeleted, err := r.areDependentsDeleted()
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !dependentsDeleted {
+			return ctrl.Result{Requeue: true, RequeueAfter: 10 * time.Second}, nil
+		}
+		if r.checkUninstallCondition() && r.managedOCS.UID == "" && dependentsDeleted {
+			if err := r.removeOlmComponents(); err != nil {
+				return ctrl.Result{}, err
 			}
 		}
 	}
@@ -337,7 +339,7 @@ func (r *ManagedOCSReconciler) checkUninstallCondition() bool {
 	return ok
 }
 
-func (r *ManagedOCSReconciler) removeOlmComponents() (reconcile.Result, error) {
+func (r *ManagedOCSReconciler) removeOlmComponents() error {
 
 	r.Log.Info("Deleting subscription")
 	subscription := &operators.Subscription{
@@ -347,16 +349,15 @@ func (r *ManagedOCSReconciler) removeOlmComponents() (reconcile.Result, error) {
 		},
 	}
 	if err := r.deleteResource(r.Client, subscription, r.AddonSubscriptionName); err != nil {
-		return ctrl.Result{}, err
+		return err
 	}
 	r.Log.Info("subscription removed successfully")
-
 	r.Log.Info("Deleting CSV")
 	csvList := &operators.ClusterServiceVersionList{}
 	err := r.Client.List(r.ctx, csvList)
 	if err != nil {
 		r.Log.Error(err, "Unable to list CSVs")
-		return ctrl.Result{}, err
+		return err
 	}
 	for _, csv := range csvList.Items {
 		if strings.HasPrefix(csv.Name, deployerCsvPrefix) {
@@ -368,13 +369,13 @@ func (r *ManagedOCSReconciler) removeOlmComponents() (reconcile.Result, error) {
 				},
 			}
 			if err := r.deleteResource(r.Client, csv, deployerCsvName); err != nil {
-				return ctrl.Result{}, err
+				return err
 			}
 		}
 	}
 	r.Log.Info("CSV removed successfully")
 
-	return ctrl.Result{}, nil
+	return nil
 }
 
 func (r *ManagedOCSReconciler) areComponentsReadyForUninstall() bool {
@@ -384,6 +385,19 @@ func (r *ManagedOCSReconciler) areComponentsReadyForUninstall() bool {
 		return false
 	}
 	return true
+}
+
+func (r *ManagedOCSReconciler) areDependentsDeleted() (bool, error) {
+	err := r.Client.Get(context.Background(), types.NamespacedName{Name: storageClusterName,
+		Namespace: r.namespace}, &ocsv1.StorageCluster{})
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			return false, err
+		}
+	} else {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (r *ManagedOCSReconciler) findOcsPvcs() (bool, error) {
@@ -403,7 +417,7 @@ func (r *ManagedOCSReconciler) findOcsPvcs() (bool, error) {
 }
 
 func (r *ManagedOCSReconciler) deleteResource(cl client.Client, resource runtime.Object, resourceName string) error {
-	err := cl.Delete(r.ctx, resource, client.PropagationPolicy(metav1.DeletePropagationForeground))
+	err := cl.Delete(r.ctx, resource)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil

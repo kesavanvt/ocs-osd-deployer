@@ -426,9 +426,25 @@ var _ = Describe("ManagedOCS controller", func() {
 				Expect(k8sClient.Get(ctx, utils.GetResourceKey(cm), cm)).Should(Succeed())
 
 				// wait to trigger the reconcile logic
-				time.Sleep(time.Second * 3)
+				time.Sleep(time.Second * 10)
+
+				// Expect(k8sClient.Get(ctx, utils.GetResourceKey(sc), sc)).Should(Succeed())
+				// fmt.Println("----------------------heloo------------------------------------------------")
+				// fmt.Println(sc)
+				// fmt.Println(*sc.OwnerReferences[0].BlockOwnerDeletion)
+				// fmt.Println(*sc.OwnerReferences[0].Controller)
 
 				utils.EnsureNoResource(k8sClient, ctx, managedOCS, timeout, interval)
+
+
+				// scKey := utils.GetResourceKey(sc)
+				// Eventually(func() bool {
+				// 	err := k8sClient.Get(ctx, scKey, sc)
+				// 	return err != nil
+				// }, timeout, interval).Should(BeTrue())
+				// Expect(k8sClient.Delete(ctx, sc)).Should(Succeed())
+
+				// time.Sleep(time.Second * 10)
 
 				utils.EnsureNoResource(k8sClient, ctx, sc, timeout, interval)
 

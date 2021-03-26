@@ -109,7 +109,7 @@ func main() {
 		AddonParamSecretName:    fmt.Sprintf("addon-%v-parameters", addonName),
 		DeleteConfigMapName:     addonName,
 		DeleteConfigMapLabelKey: fmt.Sprintf("api.openshift.com/addon-%v-delete", addonName),
-		AddonSubscriptionName:   fmt.Sprintf("addon-%v", addonName),
+		AddonSubscriptionName:   fmt.Sprintf("ocs-osd-deployer-dev-v0-0-1-sub"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ManagedOCS")
 		os.Exit(1)
