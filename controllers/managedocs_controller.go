@@ -67,6 +67,7 @@ const (
 	deployerCSVPrefix            = "ocs-osd-deployer"
 	monLabelKey                  = "app"
 	monLabelValue                = "managed-ocs"
+	ocsInitializationName        = "ocsinit"
 )
 
 // ManagedOCSReconciler reconciles a ManagedOCS object
@@ -86,6 +87,7 @@ type ManagedOCSReconciler struct {
 	ctx                      context.Context
 	managedOCS               *v1.ManagedOCS
 	storageCluster           *ocsv1.StorageCluster
+	ocsInitialization        *ocsv1.OCSInitialization
 	prometheus               *promv1.Prometheus
 	dmsRule                  *promv1.PrometheusRule
 	alertmanager             *promv1.Alertmanager
@@ -100,6 +102,7 @@ type ManagedOCSReconciler struct {
 // +kubebuilder:rbac:groups=ocs.openshift.io,namespace=system,resources={managedocs,managedocs/finalizers},verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=ocs.openshift.io,namespace=system,resources=managedocs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ocs.openshift.io,namespace=system,resources=storageclusters,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=ocs.openshift.io,namespace=system,resources=ocsinitializations,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="monitoring.coreos.com",namespace=system,resources={alertmanagers,prometheuses},verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="monitoring.coreos.com",namespace=system,resources={podmonitors,servicemonitors,prometheusrules},verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",namespace=system,resources=secrets,verbs=create;get;list;watch
@@ -163,6 +166,14 @@ func (r *ManagedOCSReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			},
 		),
 	)
+	ocsInitializationPredicates := builder.WithPredicates(
+		predicate.NewPredicateFuncs(
+			func(meta metav1.Object, _ runtime.Object) bool {
+				name := meta.GetName()
+				return name == ocsInitializationName
+			},
+		),
+	)
 	enqueueManangedOCSRequest := handler.EnqueueRequestsFromMapFunc{
 		ToRequests: handler.ToRequestsFunc(
 			func(obj handler.MapObject) []reconcile.Request {
@@ -216,6 +227,11 @@ func (r *ManagedOCSReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&source.Kind{Type: &appsv1.StatefulSet{}},
 			&enqueueManangedOCSRequest,
 			monStatefulSetPredicates,
+		).
+		Watches(
+			&source.Kind{Type: &ocsv1.OCSInitialization{}},
+			&enqueueManangedOCSRequest,
+			ocsInitializationPredicates,
 		).
 
 		// Create the controller
@@ -272,6 +288,10 @@ func (r *ManagedOCSReconciler) initReconciler(req ctrl.Request) {
 	r.storageCluster = &ocsv1.StorageCluster{}
 	r.storageCluster.Name = storageClusterName
 	r.storageCluster.Namespace = r.namespace
+
+	r.ocsInitialization = &ocsv1.OCSInitialization{}
+	r.ocsInitialization.Name = ocsInitializationName
+	r.ocsInitialization.Namespace = r.namespace
 
 	r.prometheus = &promv1.Prometheus{}
 	r.prometheus.Name = prometheusName
@@ -337,6 +357,9 @@ func (r *ManagedOCSReconciler) reconcilePhases() (reconcile.Result, error) {
 
 		// Reconcile the different owned resources
 		if err := r.reconcileStorageCluster(); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.reconcileOCSInitialization(); err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.reconcilePrometheus(); err != nil {
@@ -589,6 +612,22 @@ func (r *ManagedOCSReconciler) reconcileDMSPrometheusRule() error {
 		return err
 	}
 
+	return nil
+}
+
+func (r *ManagedOCSReconciler) reconcileOCSInitialization() error {
+	r.Log.Info("Reconciling OCSInitialization")
+
+	if err := r.get(r.ocsInitialization); err == nil {
+		r.ocsInitialization.Spec.EnableCephTools = true
+		if err = r.Client.Update(r.ctx, r.ocsInitialization); err != nil {
+			return err
+		}
+	} else if errors.IsNotFound(err) {
+		r.Log.V(-1).Info("OCSInitialization resource not found")
+	} else {
+		return fmt.Errorf("Unable to get OCSInitialization resource: %v", err)
+	}
 	return nil
 }
 
