@@ -29,6 +29,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -65,6 +66,8 @@ const (
 	storageClassRbdName          = "ocs-storagecluster-ceph-rbd"
 	storageClassCephFSName       = "ocs-storagecluster-cephfs"
 	deployerCSVPrefix            = "ocs-osd-deployer"
+	ocsOperatorName              = "ocs-operator"
+	rookCephOperatorName         = "rook-ceph-operator"
 	monLabelKey                  = "app"
 	monLabelValue                = "managed-ocs"
 )
@@ -344,6 +347,9 @@ func (r *ManagedOCSReconciler) reconcilePhases() (reconcile.Result, error) {
 
 		// Reconcile the different owned resources
 		if err := r.reconcileStorageCluster(); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.reconcileOCSCSV(); err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.reconcilePrometheus(); err != nil {
@@ -830,6 +836,47 @@ func (r *ManagedOCSReconciler) findOCSVolumeClaims() (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func (r *ManagedOCSReconciler) reconcileOCSCSV() error {
+	csvList := opv1a1.ClusterServiceVersionList{}
+	if err := r.list(&csvList); err != nil {
+		return fmt.Errorf("unable to list csv resources: %v", err)
+	}
+
+	var csv *opv1a1.ClusterServiceVersion = nil
+	for index := range csvList.Items {
+		candidate := &csvList.Items[index]
+		if strings.HasPrefix(candidate.Name, ocsOperatorName) {
+			csv = candidate
+			break
+		}
+	}
+	if csv == nil {
+		r.Log.V(-1).Info("OCS CSV not found")
+	} else {
+		resourceConfig := corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				"cpu":    resource.MustParse("250m"),
+				"memory": resource.MustParse("512Mi"),
+			},
+			Requests: corev1.ResourceList{
+				"cpu":    resource.MustParse("250m"),
+				"memory": resource.MustParse("512Mi"),
+			},
+		}
+		deployments := csv.Spec.InstallStrategy.StrategySpec.DeploymentSpecs
+		for i := range deployments {
+			operator := &deployments[i].Spec.Template.Spec.Containers[0]
+			if operator.Name == ocsOperatorName || operator.Name == rookCephOperatorName {
+				operator.Resources = resourceConfig
+			}
+		}
+		if err := r.update(csv); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *ManagedOCSReconciler) removeOLMComponents() error {
